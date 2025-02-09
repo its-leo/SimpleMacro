@@ -1,6 +1,6 @@
 package util
 
-import org.opencv.core.{CvType, Mat, Point, Rect}
+import org.opencv.core.{CvType, Mat}
 
 import java.awt.image.{BufferedImage, DataBufferByte}
 
@@ -23,9 +23,5 @@ object Utils {
     }
   }
 
-  implicit class agdMat(m: Mat) {
-
-    def getRect(point: Point): Rect = new Rect(point, new Point(point.x + m.cols, point.y + m.rows))
-  }
 
 }
