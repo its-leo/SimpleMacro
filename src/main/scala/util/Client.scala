@@ -1,13 +1,12 @@
 package util
 
-import javafx.beans.property.SimpleStringProperty
-import javafx.beans.binding.Bindings
 import com.sun.jna.platform.win32.User32
 import com.sun.jna.platform.win32.WinDef.{HWND, RECT}
 import com.sun.jna.platform.{DesktopWindow, WindowUtils}
 import cv.Image.agdImageBuffer
 import javafx.animation.Animation
 import javafx.beans.binding.Bindings
+import javafx.beans.property.SimpleStringProperty
 import javafx.embed.swing.SwingFXUtils
 import javafx.scene.input.MouseButton
 import scalafx.application.JFXApp3.PrimaryStage
@@ -29,7 +28,6 @@ import java.awt.image.BufferedImage
 import java.awt.{Dimension, Rectangle, Robot}
 import java.io.File
 import java.time.format.DateTimeFormatter
-import java.time.temporal.ChronoUnit
 import java.time.{Duration, LocalDate, LocalDateTime, LocalTime}
 import java.util.concurrent.{Executors, TimeUnit}
 import javax.swing.filechooser.FileSystemView
@@ -41,7 +39,7 @@ object Client extends JFXApp3 {
 
   case class ClickPosition(x: Int, y: Int, windowDimension: Dimension, clickSettings: ClickSettings = ClickSettings())
 
-  case class ClickSettings(button: String = "left", duration: Int = 100, clicks: Int = 1, mouseSpeed: Double = 1.0)
+  case class ClickSettings(button: String = "left", duration: Int = 500, clicks: Int = 1, mouseSpeed: Double = 1.0)
 
   case class Step(step: String, capturedImageOption: Option[BufferedImage] = None, clickPositionOption: Option[ClickPosition] = None, typeTextOption: Option[String] = None, waitSecondsOption: Option[Int] = None, clickSettings: ClickSettings = ClickSettings())
 
@@ -458,7 +456,6 @@ object Client extends JFXApp3 {
         }
       }
     }
-    import scalafx.Includes._
 
     new Scene(700, 500) {
       root = new BorderPane {
@@ -761,6 +758,7 @@ object Client extends JFXApp3 {
               selectedWindow.foreach { window =>
 
                 val hwnd = window.getHWND
+                windowToFront(hwnd)
 
                 val rect = new RECT()
                 User32.INSTANCE.GetWindowRect(hwnd, rect)
@@ -779,13 +777,26 @@ object Client extends JFXApp3 {
                 val screenCapture = robot.createScreenCapture(screenRect)
 
                 // Perform template matching to find the captured image
-                val matchRect = screenCapture.findBestMatch(capturedImage).rect
+                screenCapture.findBestMatch(capturedImage) match {
+                  case Some(match0) =>
+                    val matchRect = match0.rect
 
-                // Calculate the center of the matched rectangle
-                val centerX = x + matchRect.x + matchRect.width / 2
-                val centerY = y + matchRect.y + matchRect.height / 2
+                    // Calculate the center of the matched rectangle
+                    val centerX = x + matchRect.x + matchRect.width / 2
+                    val centerY = y + matchRect.y + matchRect.height / 2
 
-                performClick(centerX, centerY, step)
+                    performClick(centerX, centerY, step)
+                  case None => {
+                    println("Unable to find the captured image in the window")
+                    Platform.runLater {
+                      new Alert(AlertType.Error) {
+                        title = "Image Not Found"
+                        headerText = "The captured image was not found in the window."
+                      }.showAndWait()
+                    }
+
+                  }
+                }
               }
             }
 
