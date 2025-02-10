@@ -8,6 +8,24 @@ SimpleMacro is a Java-based project that utilizes computer vision and native int
 ## Project Overview
 SimpleMacro is designed to provide macro functionality using computer vision techniques. It leverages OpenCV for image processing and JNA for native system interactions.
 
+## Screenshots
+
+### Main Window
+![Main Window](src/main/resources/screenshots/main_window_screenshot.png)
+*Caption: The main window of SimpleMacro showing the window selection step.*
+
+### Action Configuration
+![Action Configuration](src/main/resources/screenshots/action_config_screenshot.png)
+*Caption: Configuring a macro action in SimpleMacro.*
+
+### Add Action Pane
+![Add Action Pane](src/main/resources/screenshots/add_action_pane_screenshot.png)
+*Caption: The Add Action pane in SimpleMacro, where users can configure new macro actions.*
+
+### Macro Execution
+![Macro Execution](src/main/resources/screenshots/macro_execution_screenshot.png)
+*Caption: SimpleMacro executing a configured macro.*
+
 ## Prerequisites
 - Java Development Kit (JDK) 11 or higher
 - Scala 2.13.16
