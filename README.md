@@ -11,19 +11,19 @@ SimpleMacro is designed to provide macro functionality using computer vision tec
 ## Screenshots
 
 ### Main Window
-![Main Window](src/main/resources/screenshots/main_window_screenshot.png)
+![Main Window](src/main/resources/screenshots/main_window_screenshot.png)<br>
 *Caption: The main window of SimpleMacro showing the window selection step.*
 
 ### Action Configuration
-![Action Configuration](src/main/resources/screenshots/action_config_screenshot.png)
+![Action Configuration](src/main/resources/screenshots/action_config_screenshot.png)<br>
 *Caption: Configuring a macro action in SimpleMacro.*
 
 ### Add Action Pane
-![Add Action Pane](src/main/resources/screenshots/add_action_pane_screenshot.png)
+![Add Action Pane](src/main/resources/screenshots/add_action_pane_screenshot.png)<br>
 *Caption: The Add Action pane in SimpleMacro, where users can configure new macro actions.*
 
 ### Macro Execution
-![Macro Execution](src/main/resources/screenshots/macro_execution_screenshot.png)
+![Macro Execution](src/main/resources/screenshots/macro_execution_screenshot.png)<br>
 *Caption: SimpleMacro executing a configured macro.*
 
 ## Prerequisites
