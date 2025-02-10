@@ -742,6 +742,7 @@ object Client extends JFXApp3 {
       title = "Add Action"
       width = 465
       height = 570
+      icons += new Image(getClass.getResourceAsStream("/icons/robot_icon.png"))
       resizable = false
       initModality(Modality.None)
       initOwner(stage)
@@ -907,7 +908,8 @@ object Client extends JFXApp3 {
       title = "Edit Action"
       width = 440
       height = 500
-      //      resizable = false
+      icons += new Image(getClass.getResourceAsStream("/icons/robot_icon.png"))
+            resizable = false
       initModality(Modality.None)
       initOwner(stage)
     }
