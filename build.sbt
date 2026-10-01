@@ -23,8 +23,9 @@ lazy val root = (project in file("."))
       "com.github.kwhat"       % "jnativehook"   % "2.2.2",
       "org.openpnp"            % "opencv"        % "4.9.0-0",
       "org.slf4j"              % "slf4j-simple"  % "2.0.16",
+      "com.lihaoyi"           %% "ujson"         % "4.4.3",
       "org.scalatest"         %% "scalatest"     % "3.2.19" % Test
     ) ++ javaFXModules.map(m => "org.openjfx" % s"javafx-$m" % javaFXVersion classifier osName),
-    Compile / mainClass := Some("util.Client"),
+    Compile / mainClass := Some("ui.Client"),
     run / fork := true
   )

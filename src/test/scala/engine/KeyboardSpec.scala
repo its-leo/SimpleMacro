@@ -1,7 +1,7 @@
-package util
+package engine
 
 import org.scalatest.funsuite.AnyFunSuite
-import util.Keyboard.{Key, Paste}
+import engine.Keyboard.{Key, Paste}
 
 import java.awt.event.KeyEvent
 

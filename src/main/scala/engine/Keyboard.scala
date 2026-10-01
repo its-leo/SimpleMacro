@@ -1,9 +1,6 @@
-package util
+package engine
 
-import java.awt.datatransfer.{Clipboard, DataFlavor, StringSelection, Transferable}
 import java.awt.event.KeyEvent
-import java.awt.{Robot, Toolkit}
-import scala.util.Try
 
 object Keyboard {
 
@@ -40,33 +37,11 @@ object Keyboard {
       }
     }.reverse
 
-  def typeText(robot: Robot, text: String, shouldStop: () => Boolean, delayMs: Int = 50): Unit =
-    segments(text).iterator.takeWhile(_ => !shouldStop()).foreach {
-      case Key(keyCode, shift) =>
-        if (shift) robot.keyPress(KeyEvent.VK_SHIFT)
-        robot.keyPress(keyCode)
-        robot.keyRelease(keyCode)
-        if (shift) robot.keyRelease(KeyEvent.VK_SHIFT)
-        robot.delay(delayMs)
-      case Paste(chunk) =>
-        paste(robot, chunk)
-        robot.delay(delayMs)
-    }
+  /** Modifier key codes in the order they are pressed (released in reverse order). */
+  def modifierKeys(ctrl: Boolean, alt: Boolean, shift: Boolean, meta: Boolean): Seq[Int] =
+    Seq(ctrl -> KeyEvent.VK_CONTROL, alt -> KeyEvent.VK_ALT, shift -> KeyEvent.VK_SHIFT, meta -> KeyEvent.VK_WINDOWS)
+      .collect { case (true, code) => code }
 
-  private def paste(robot: Robot, text: String): Unit = {
-    val clipboard: Clipboard = Toolkit.getDefaultToolkit.getSystemClipboard
-    val previous: Option[Transferable] = Try(clipboard.getContents(null)).toOption.flatMap(Option(_))
-
-    clipboard.setContents(new StringSelection(text), null)
-    robot.keyPress(KeyEvent.VK_CONTROL)
-    robot.keyPress(KeyEvent.VK_V)
-    robot.keyRelease(KeyEvent.VK_V)
-    robot.keyRelease(KeyEvent.VK_CONTROL)
-    // Give the target application time to read the clipboard before restoring it
-    robot.delay(150)
-
-    previous.filter(_.isDataFlavorSupported(DataFlavor.stringFlavor)).foreach { p =>
-      Try(clipboard.setContents(p, null))
-    }
-  }
+  def isModifier(keyCode: Int): Boolean =
+    Set(KeyEvent.VK_CONTROL, KeyEvent.VK_ALT, KeyEvent.VK_SHIFT, KeyEvent.VK_WINDOWS, KeyEvent.VK_META, KeyEvent.VK_ALT_GRAPH).contains(keyCode)
 }
