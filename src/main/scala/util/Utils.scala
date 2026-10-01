@@ -10,7 +10,9 @@ object Utils {
 
     private def to3ByteBGRType = {
       val convertedImage = new BufferedImage(bi.getWidth, bi.getHeight, BufferedImage.TYPE_3BYTE_BGR)
-      convertedImage.getGraphics.drawImage(bi, 0, 0, null)
+      val g = convertedImage.createGraphics()
+      g.drawImage(bi, 0, 0, null)
+      g.dispose()
       convertedImage
     }
 
@@ -21,7 +23,28 @@ object Utils {
       mat.put(0, 0, data)
       mat
     }
+
+    /** Independent copy of a region (getSubimage shares the raster with the source image). */
+    def crop(x: Int, y: Int, width: Int, height: Int): BufferedImage = {
+      val copy = new BufferedImage(width, height, BufferedImage.TYPE_3BYTE_BGR)
+      val g = copy.createGraphics()
+      g.drawImage(bi.getSubimage(x, y, width, height), 0, 0, null)
+      g.dispose()
+      copy
+    }
   }
 
+  /** Human readable duration, e.g. 3725 -> "1 hour 2 minutes 5 seconds". */
+  def formatDuration(totalSeconds: Int): String = {
+    def unit(value: Int, name: String) = if (value > 0) Some(s"$value $name${if (value > 1) "s" else ""}") else None
 
+    Seq(
+      unit(totalSeconds / 3600, "hour"),
+      unit((totalSeconds % 3600) / 60, "minute"),
+      unit(totalSeconds % 60, "second")
+    ).flatten match {
+      case Nil => "0 seconds"
+      case parts => parts.mkString(" ")
+    }
+  }
 }

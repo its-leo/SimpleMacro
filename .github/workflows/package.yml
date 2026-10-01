@@ -1,0 +1,83 @@
+# Builds the Windows application (portable zip with its own Java runtime, no installation needed).
+# - Pull requests: the zip is available as a workflow artifact for testing.
+# - Pushes to main: additionally published as GitHub release "v<version from build.sbt>".
+#   Bump the version in build.sbt to create a new release; otherwise the existing release is updated.
+
+name: Windows Package
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+        cache: 'sbt'
+    - name: Set up sbt
+      uses: sbt/setup-sbt@v1
+
+    - name: Build jar
+      shell: bash
+      run: sbt assembly
+
+    - name: Read version
+      id: version
+      shell: pwsh
+      run: |
+        $version = (Select-String -Path build.sbt -Pattern 'version\s*:=\s*"([0-9]+\.[0-9]+\.[0-9]+)').Matches[0].Groups[1].Value
+        "version=$version" >> $env:GITHUB_OUTPUT
+
+    - name: Create application
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force target/package | Out-Null
+        Copy-Item target/scala-2.13/SimpleMacro.jar target/package/
+        jpackage --type app-image `
+          --name SimpleMacro `
+          --input target/package `
+          --main-jar SimpleMacro.jar `
+          --main-class ui.Client `
+          --icon packaging/SimpleMacro.ico `
+          --app-version ${{ steps.version.outputs.version }} `
+          --vendor SimpleMacro `
+          --description "Macro automation for Windows" `
+          --add-modules java.base,java.desktop,java.logging,java.prefs,java.scripting,java.xml,java.management,java.naming,jdk.unsupported,jdk.unsupported.desktop,jdk.jfr,jdk.charsets,jdk.localedata `
+          --jlink-options "--strip-debug --no-header-files --no-man-pages --compress=zip-6" `
+          --dest target/dist
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        Compress-Archive -Path target/dist/SimpleMacro -DestinationPath SimpleMacro-windows.zip
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: SimpleMacro-windows
+        path: SimpleMacro-windows.zip
+
+    - name: Publish release
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v${{ steps.version.outputs.version }}
+        name: SimpleMacro ${{ steps.version.outputs.version }}
+        target_commitish: ${{ github.sha }}
+        files: SimpleMacro-windows.zip
+        fail_on_unmatched_files: true
+        body: |
+          Download **SimpleMacro-windows.zip**, extract it and start `SimpleMacro\SimpleMacro.exe`.
+          No installation and no Java required.
