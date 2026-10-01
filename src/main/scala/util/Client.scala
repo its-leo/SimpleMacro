@@ -2,17 +2,16 @@ package util
 
 import com.github.kwhat.jnativehook.GlobalScreen
 import com.github.kwhat.jnativehook.keyboard.{NativeKeyEvent, NativeKeyListener}
-import com.sun.jna.platform.win32.User32
+import com.sun.jna.platform.win32.{User32, WinUser}
 import com.sun.jna.platform.win32.WinDef.{HWND, RECT}
 import com.sun.jna.platform.{DesktopWindow, WindowUtils}
 import cv.Image.agdImageBuffer
 import javafx.animation.Animation
 import javafx.beans.binding.Bindings
-import javafx.beans.property.SimpleStringProperty
+import javafx.beans.property.{SimpleBooleanProperty, SimpleStringProperty}
 import javafx.embed.swing.SwingFXUtils
-import javafx.event.EventType
 import javafx.scene.image.Image
-import javafx.scene.input.{KeyCode, KeyEvent, MouseEvent}
+import javafx.scene.input.MouseEvent
 import scalafx.application.JFXApp3.PrimaryStage
 import scalafx.application.{JFXApp3, Platform}
 import scalafx.collections.ObservableBuffer
@@ -27,27 +26,41 @@ import scalafx.scene.text.Font
 import scalafx.scene.{Node, Scene}
 import scalafx.stage.{Modality, Screen, Stage}
 
-import java.util.logging.Level
-import java.util.logging.Logger
+import util.Utils.agdBufferedImage
+
 import java.awt.event.InputEvent
 import java.awt.image.BufferedImage
 import java.awt.{Dimension, Rectangle, Robot}
 import java.io.File
 import java.time.format.DateTimeFormatter
 import java.time.{Duration, LocalDateTime}
-import java.util.concurrent.{Executors, TimeUnit}
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.{Executors, ScheduledExecutorService, TimeUnit}
+import java.util.logging.{Level, Logger}
 import javax.swing.filechooser.FileSystemView
 import scala.jdk.CollectionConverters._
+import scala.util.Try
 
 object Client extends JFXApp3 {
 
   private var selectedWindow: Option[DesktopWindow] = None
 
-  var stopRequested = false
+  // Written by the global key listener thread and read by the macro worker thread
+  @volatile var stopRequested = false
+
+  // True while a macro is running or scheduled; only modified on the JavaFX thread
+  private val busy = new SimpleBooleanProperty(false)
+
+  private var activeScheduler: Option[ScheduledExecutorService] = None
+
+  // How long "Click Visual" keeps looking for the captured image before giving up
+  private val VisualSearchTimeoutMs = 5000
+
+  private val OwnWindowTitles = Set("SimpleMacro", "Add Action", "Edit Action", "Select Area to Capture", "Click Position")
 
   private case class ClickPosition(x: Int, y: Int, windowDimension: Dimension)
 
-  private case class ClickSettings(button: String = "left", duration: Int = 500, clicks: Int = 1, mouseSpeed: Double = 1.0)
+  private case class ClickSettings(button: String = "left", duration: Int = 100, clicks: Int = 1, mouseSpeed: Double = 1.0)
 
   private case class Action(actionType: String, capturedImageOption: Option[BufferedImage] = None, clickPositionOption: Option[ClickPosition] = None, typeTextOption: Option[String] = None, waitSecondsOption: Option[Int] = None, clickSettings: ClickSettings = ClickSettings()) {
 
@@ -63,7 +76,35 @@ object Client extends JFXApp3 {
   }
 
   private trait ActionTabContent {
-    def createAction(): Action
+    /** Either the configured action or an error message explaining what is missing. */
+    def createAction(): Either[String, Action]
+  }
+
+  private def showWarning(titleText: String, message: String): Unit = {
+    new Alert(AlertType.Warning) {
+      initOwner(stage)
+      title = titleText
+      headerText = message
+    }.showAndWait()
+  }
+
+  /** Editable spinners only commit typed text on ENTER; also commit when the editor loses focus. */
+  private def commitOnFocusLost[T](spinner: Spinner[T]): Spinner[T] = {
+    spinner.delegate.getEditor.focusedProperty.addListener((_, _, focused) => if (!focused) commitSpinner(spinner))
+    spinner
+  }
+
+  private def commitSpinner[T](spinner: Spinner[T]): Unit = {
+    val jfxSpinner = spinner.delegate
+    if (jfxSpinner.isEditable && Try(jfxSpinner.commitValue()).isFailure) {
+      // Invalid input: restore the last valid value
+      jfxSpinner.getEditor.setText(jfxSpinner.getValueFactory.getConverter.toString(jfxSpinner.getValue))
+    }
+  }
+
+  private def spinnerValue[T](spinner: Spinner[T]): T = {
+    commitSpinner(spinner)
+    spinner.value.value
   }
 
   private val actions: ObservableBuffer[Action] = ObservableBuffer.empty[Action]
@@ -79,11 +120,11 @@ object Client extends JFXApp3 {
     GlobalScreen.registerNativeHook()
     GlobalScreen.addNativeKeyListener(new NativeKeyListener {
       override def nativeKeyPressed(e: NativeKeyEvent): Unit = {
-        if (e.getKeyCode == NativeKeyEvent.VC_ESCAPE) {
-          Platform.runLater {
-            stopRequested = true
-            println("Stop requested by user (global)")
-          }
+        if (e.getKeyCode == NativeKeyEvent.VC_ESCAPE && busy.get()) {
+          // Set directly: the JavaFX thread may be busy, so runLater could delay the stop
+          stopRequested = true
+          println("Stop requested by user (global)")
+          Platform.runLater(cancelSchedule())
         }
       }
 
@@ -118,9 +159,15 @@ object Client extends JFXApp3 {
     showStep(1)
   }
 
+  override def stopApp(): Unit = {
+    stopRequested = true
+    activeScheduler.foreach(_.shutdownNow())
+    // The native hook thread would otherwise keep the JVM alive after the window is closed
+    Try(GlobalScreen.unregisterNativeHook())
+  }
+
 
   private def createStep1Scene(): Scene = {
-    actions.clear()
 
     def getIcon(path: String): BufferedImage = {
       val icon = FileSystemView.getFileSystemView.getSystemIcon(new File(path))
@@ -139,13 +186,14 @@ object Client extends JFXApp3 {
 
     case class WindowItem(window: DesktopWindow, icon: BufferedImage)
 
+    var searchTerm = ""
+
     def getWindowItems: Array[WindowItem] = {
 
       WindowUtils.getAllWindows(true).asScala
-        .filter(w => w.getTitle.nonEmpty && !w.getTitle.contains("Task Manager"))
-        .tail
-        .map(w => WindowItem(w, Option(WindowUtils.getWindowIcon(w.getHWND)).getOrElse(getIcon(w.getFilePath))))
-        .filterNot(_.icon == null)
+        .filter(w => w.getTitle.nonEmpty && !w.getTitle.contains("Task Manager") && !OwnWindowTitles.contains(w.getTitle))
+        .filter(_.getTitle.toLowerCase.contains(searchTerm))
+        .flatMap(w => Option(WindowUtils.getWindowIcon(w.getHWND)).orElse(Try(getIcon(w.getFilePath)).toOption).map(WindowItem(w, _)))
         .toArray
     }
 
@@ -217,10 +265,10 @@ object Client extends JFXApp3 {
             new TextField {
               promptText = "Filter windows..."
               style = "-fx-font-size: 14px;"
-              onKeyReleased = (e: javafx.scene.input.KeyEvent) => {
-                val searchTerm = text.value.toLowerCase
+              onKeyReleased = (_: javafx.scene.input.KeyEvent) => {
+                searchTerm = text.value.toLowerCase
                 filteredItems.clear()
-                filteredItems.addAll(getWindowItems.filter(_.window.getTitle.toLowerCase.contains(searchTerm)))
+                filteredItems.addAll(getWindowItems)
               }
             },
             listView
@@ -233,11 +281,13 @@ object Client extends JFXApp3 {
             new Button("Next") {
               style = "-fx-background-color: #4682B4; -fx-text-fill: white; -fx-font-size: 14px; -fx-padding: 8 15;"
               onAction = _ => {
-                val selectedItem = this.getScene.lookup(".list-view").asInstanceOf[javafx.scene.control.ListView[WindowItem]].getSelectionModel.getSelectedItem
+                val selectedItem = listView.selectionModel().getSelectedItem
                 if (selectedItem != null) {
                   selectedWindow = Some(selectedItem.window)
                   refreshTimeline.stop()
                   showStep(2)
+                } else {
+                  showWarning("No window selected", "Please select the window the macro should run in.")
                 }
               }
             }
@@ -252,8 +302,13 @@ object Client extends JFXApp3 {
   //---------------------------------------------------------------------
 
 
-  private def createCommonClickLayout(existingAction: Option[Action] = None): Seq[Node] = {
+  /** Returns the click setting controls and a function reading the configured settings. */
+  private def createCommonClickLayout(existingAction: Option[Action] = None): (Seq[Node], () => ClickSettings) = {
     val buttonGroup = new ToggleGroup()
+    // Prevent deselecting the active button, which would leave no button selected
+    buttonGroup.selectedToggle.onChange { (_, oldToggle, newToggle) =>
+      if (newToggle == null && oldToggle != null) buttonGroup.selectToggle(oldToggle)
+    }
     val leftButton = new ToggleButton("Left") {
       id = "leftMouse"
       selected = existingAction.forall(_.clickSettings.button == "left")
@@ -277,28 +332,34 @@ object Client extends JFXApp3 {
 
     val spinnerWidth = 140
 
-    val durationSpinner = new Spinner[Int](1, 1000, existingAction.map(_.clickSettings.duration).getOrElse(100)) {
-      id = "durationSpinner"
-      editable = true
-      prefWidth = spinnerWidth
-    }
+    val defaults = existingAction.map(_.clickSettings).getOrElse(ClickSettings())
 
-    val clicksSpinner = new Spinner[Int](0, 10, existingAction.map(_.clickSettings.clicks).getOrElse(1)) {
-      id = "clicksSpinner"
+    val durationSpinner = commitOnFocusLost(new Spinner[Int](0, 10000, defaults.duration, 50) {
       editable = true
       prefWidth = spinnerWidth
-    }
+    })
 
-    val speedSpinner = new Spinner[Double](0.1, 5.0, existingAction.map(_.clickSettings.mouseSpeed).getOrElse(1.0), 0.1) {
-      id = "speedSpinner"
+    val clicksSpinner = commitOnFocusLost(new Spinner[Int](0, 10, defaults.clicks) {
       editable = true
       prefWidth = spinnerWidth
-    }
+    })
+
+    val speedSpinner = commitOnFocusLost(new Spinner[Double](0.1, 5.0, defaults.mouseSpeed, 0.1) {
+      editable = true
+      prefWidth = spinnerWidth
+    })
+
+    def readSettings(): ClickSettings = ClickSettings(
+      button = if (leftButton.selected.value) "left" else "right",
+      duration = spinnerValue(durationSpinner),
+      clicks = spinnerValue(clicksSpinner),
+      mouseSpeed = spinnerValue(speedSpinner)
+    )
 
     val labelWidth = 120
     val controlWidth = 150
 
-    Seq(
+    (Seq(
       new HBox(10) {
         alignment = Pos.Center
         children = Seq(
@@ -315,7 +376,7 @@ object Client extends JFXApp3 {
       new HBox(10) {
         alignment = Pos.Center
         children = Seq(
-          new Label("Duration (ms):") {
+          new Label("Delay after (ms):") {
             prefWidth = labelWidth
           },
           new HBox {
@@ -351,136 +412,95 @@ object Client extends JFXApp3 {
           }
         )
       }
-    )
+    ), () => readSettings())
   }
 
 
   private def captureMousePositionContent(existingAction: Option[Action] = None): Node = {
+    var clickPositionOption: Option[ClickPosition] = existingAction.flatMap(_.clickPositionOption)
+
     val positionLabel = new Label() {
-      id = "positionLabel"
-      visible = false
       style = "-fx-font-size: 14px; -fx-text-fill: #4CAF50;"
     }
 
-    var clickPositionOption: Option[ClickPosition] = None
+    def updatePositionLabel(): Unit = {
+      positionLabel.text = clickPositionOption.map(p => s"Recorded position: (${p.x}, ${p.y})").getOrElse("No position recorded yet")
+    }
 
-    val captureButton = new Button("Capture Position") {
-      id = "captureButton"
+    updatePositionLabel()
+
+    val captureButton = new Button(if (clickPositionOption.isDefined) "Recapture Position" else "Capture Position") {
       style = "-fx-background-color: #4CAF50; -fx-text-fill: white; -fx-font-size: 14px;"
       onAction = _ => {
-        clickPositionOption = recordMousePosition
-        clickPositionOption.foreach { mousePosition =>
-          val x = mousePosition.x
-          val y = mousePosition.y
-          positionLabel.text = s"Recorded position: ($x, $y)"
-          this.visible = false
-          positionLabel.visible = true
+        recordMousePosition.foreach { mousePosition =>
+          clickPositionOption = Some(mousePosition)
+          updatePositionLabel()
+          text = "Recapture Position"
         }
       }
     }
 
-    val positionStack = new StackPane {
+    val positionBox = new VBox(10) {
       alignment = Pos.Center
       children = Seq(captureButton, positionLabel)
       minHeight = 130 // Set a minimum height to match the image capture area
     }
 
-    val clickLayout = createCommonClickLayout(existingAction)
+    val (clickLayout, readSettings) = createCommonClickLayout(existingAction)
 
     new VBox(20) {
       alignment = Pos.BottomCenter
       padding = Insets(20)
-      children = Seq(
-        positionStack
-      ) ++ clickLayout
+      children = Seq(positionBox) ++ clickLayout
 
       userData = new ActionTabContent {
-        override def createAction(): Action = {
-          val actionName = "Click Position"
-
-          val leftMouse = clickLayout.flatMap(_.lookupAll("#leftMouse")).head.asInstanceOf[javafx.scene.control.ToggleButton]
-          val button = if (leftMouse.isSelected) "left" else "right"
-
-          val duration = clickLayout.flatMap(_.lookupAll("#durationSpinner")).head.asInstanceOf[javafx.scene.control.Spinner[Int]].getValue
-          val clicks = clickLayout.flatMap(_.lookupAll("#clicksSpinner")).head.asInstanceOf[javafx.scene.control.Spinner[Int]].getValue
-          val speed = clickLayout.flatMap(_.lookupAll("#speedSpinner")).head.asInstanceOf[javafx.scene.control.Spinner[Double]].getValue
-
-          val clickSettings: ClickSettings = ClickSettings(button, duration, clicks, speed)
-
-          val updatedClickPositionOption = clickPositionOption.orElse(existingAction.flatMap(_.clickPositionOption))
-
-          println(s"$actionName: Position = $updatedClickPositionOption, Settings = $clickSettings")
-          Action(actionName, clickPositionOption = updatedClickPositionOption, clickSettings = clickSettings)
+        override def createAction(): Either[String, Action] = clickPositionOption match {
+          case Some(position) => Right(Action("Click Position", clickPositionOption = Some(position), clickSettings = readSettings()))
+          case None => Left("Please capture a position to click first.")
         }
       }
     }
   }
 
   private def createClickVisualContent(existingAction: Option[Action] = None): Node = {
-
-
     var imageOption: Option[BufferedImage] = existingAction.flatMap(_.capturedImageOption)
 
     val imageView = new ImageView {
-      id = "imageView"
       fitWidth = 200
-      fitHeight = 130
+      fitHeight = 100
       preserveRatio = true
-      visible = false
+      image = imageOption.map(img => new FXImage(SwingFXUtils.toFXImage(img, null))).orNull
+      visible <== image.isNotNull
     }
 
-    val captureButton = new Button("Capture Image") {
-      id = "captureButton"
+    val captureButton = new Button(if (imageOption.isDefined) "Recapture Image" else "Capture Image") {
       style = "-fx-background-color: #4CAF50; -fx-text-fill: white; -fx-font-size: 14px;"
       onAction = _ => {
-        imageOption = captureImage()
-        imageOption.foreach { bufferedImage =>
-          val fxImage: Image = SwingFXUtils.toFXImage(bufferedImage, null)
-          imageView.setImage(fxImage)
-          imageView.visible = true
-          this.visible = false
+        captureImage().foreach { bufferedImage =>
+          imageOption = Some(bufferedImage)
+          imageView.image = new FXImage(SwingFXUtils.toFXImage(bufferedImage, null))
+          text = "Recapture Image"
         }
       }
     }
 
-
-    val imageStack = new StackPane {
-      id = "stackPane"
+    val imageBox = new VBox(10) {
       alignment = Pos.Center
-      children = Seq(captureButton, imageView)
+      children = Seq(imageView, captureButton)
+      minHeight = 130
     }
 
-    existingAction.flatMap(_.capturedImageOption).foreach { img =>
-      imageView.setImage(SwingFXUtils.toFXImage(img, null))
-      imageView.setVisible(true)
-      captureButton.setVisible(true)
-      captureButton.toFront()
-    }
-
-    val clickLayout = createCommonClickLayout(existingAction)
+    val (clickLayout, readSettings) = createCommonClickLayout(existingAction)
 
     new VBox(20) {
-      id = "vbox"
       alignment = Pos.BottomCenter
       padding = Insets(20)
-      children = Seq(
-        imageStack
-      ) ++ clickLayout
+      children = Seq(imageBox) ++ clickLayout
 
       userData = new ActionTabContent {
-        override def createAction(): Action = {
-          val actionName = "Click Visual"
-
-          val leftMouse = clickLayout.flatMap(_.lookupAll("#leftMouse")).head.asInstanceOf[javafx.scene.control.ToggleButton]
-          val button = if (leftMouse.isSelected) "left" else "right"
-
-          val duration = clickLayout.flatMap(_.lookupAll("#durationSpinner")).head.asInstanceOf[javafx.scene.control.Spinner[Int]].getValue
-          val clicks = clickLayout.flatMap(_.lookupAll("#clicksSpinner")).head.asInstanceOf[javafx.scene.control.Spinner[Int]].getValue
-          val speed = clickLayout.flatMap(_.lookupAll("#speedSpinner")).head.asInstanceOf[javafx.scene.control.Spinner[Double]].getValue
-
-          val clickSettings: ClickSettings = ClickSettings(button, duration, clicks, speed)
-
-          Action(actionName, capturedImageOption = imageOption, clickSettings = clickSettings)
+        override def createAction(): Either[String, Action] = imageOption match {
+          case Some(img) => Right(Action("Click Visual", capturedImageOption = Some(img), clickSettings = readSettings()))
+          case None => Left("Please capture the image to click on first.")
         }
       }
     }
@@ -490,60 +510,21 @@ object Client extends JFXApp3 {
 
     val initialSeconds = existingAction.flatMap(_.waitSecondsOption).getOrElse(3)
 
-    val hoursSpinner = new Spinner[Int](0, 23, initialSeconds / 3600) {
-      id = "hoursSpinner"
+    val hoursSpinner = commitOnFocusLost(new Spinner[Int](0, 23, initialSeconds / 3600) {
       editable = true
       prefWidth = 70
-    }
-    val minutesSpinner = new Spinner[Int](0, 59, (initialSeconds % 3600) / 60) {
-      id = "minutesSpinner"
-      editable = true
-      prefWidth = 70
-    }
-    val secondsSpinner = new Spinner[Int](0, 59, initialSeconds % 60) {
-      id = "secondsSpinner"
-      editable = true
-      prefWidth = 70
-    }
-
-    minutesSpinner.valueProperty().addListener((_, _, newValue) => {
-      if (newValue.intValue == 60) {
-        minutesSpinner.getValueFactory.setValue(0)
-        hoursSpinner.increment()
-      } else if (newValue.intValue == -1) {
-        minutesSpinner.getValueFactory.setValue(59)
-        hoursSpinner.decrement()
-      }
     })
-
-    secondsSpinner.valueProperty().addListener((_, _, newValue) => {
-      if (newValue.intValue == 60) {
-        secondsSpinner.getValueFactory.setValue(0)
-        minutesSpinner.increment()
-      } else if (newValue.intValue == -1) {
-        secondsSpinner.getValueFactory.setValue(59)
-        minutesSpinner.decrement()
-      }
+    val minutesSpinner = commitOnFocusLost(new Spinner[Int](0, 59, (initialSeconds % 3600) / 60) {
+      editable = true
+      prefWidth = 70
     })
-
+    val secondsSpinner = commitOnFocusLost(new Spinner[Int](0, 59, initialSeconds % 60) {
+      editable = true
+      prefWidth = 70
+    })
 
     val clockCanvas = new Canvas(150, 150)
     val gc = clockCanvas.graphicsContext2D
-
-    def updateSpinners(): Unit = {
-      var totalSeconds = hoursSpinner.value.value * 3600 + minutesSpinner.value.value * 60 + secondsSpinner.value.value
-
-      val hours = totalSeconds / 3600
-      totalSeconds %= 3600
-      val minutes = totalSeconds / 60
-      val seconds = totalSeconds % 60
-
-      hoursSpinner.getValueFactory.setValue(hours)
-      minutesSpinner.getValueFactory.setValue(minutes)
-      secondsSpinner.getValueFactory.setValue(seconds)
-
-      updateClock()
-    }
 
     def updateClock(): Unit = {
       val totalMinutes = hoursSpinner.value.value * 60 + minutesSpinner.value.value
@@ -612,14 +593,6 @@ object Client extends JFXApp3 {
       }
     }
 
-    // Bind the clock update to spinner value changes
-    hoursSpinner.value.onChange { (_, _, _) => updateSpinners() }
-    minutesSpinner.value.onChange { (_, _, _) => updateSpinners() }
-    secondsSpinner.value.onChange { (_, _, _) => updateSpinners() }
-
-    // Initial clock update
-    updateClock()
-
 
     val timeText = new Label {
       text <== Bindings.createStringBinding(
@@ -678,12 +651,9 @@ object Client extends JFXApp3 {
         timeText
       )
       userData = new ActionTabContent {
-        override def createAction(): Action = {
-          val actionName = "Wait"
-          val waitSecondsOption = Some(hoursSpinner.value.value * 3600 + minutesSpinner.value.value * 60 + secondsSpinner.value.value)
-
-          println(s"$actionName: waitSecondsOption = $waitSecondsOption ")
-          Action(actionName, waitSecondsOption = waitSecondsOption)
+        override def createAction(): Either[String, Action] = {
+          val waitSeconds = spinnerValue(hoursSpinner) * 3600 + spinnerValue(minutesSpinner) * 60 + spinnerValue(secondsSpinner)
+          Right(Action("Wait", waitSecondsOption = Some(waitSeconds)))
         }
       }
 
@@ -701,13 +671,16 @@ object Client extends JFXApp3 {
       padding = Insets(10)
       children = Seq(
         new Label("Text to type:"),
-        textField
+        textField,
+        new Label("Letters, digits and spaces are typed key by key; other characters are pasted via the clipboard.") {
+          wrapText = true
+          style = "-fx-font-size: 11px; -fx-text-fill: gray;"
+        }
       )
       userData = new ActionTabContent {
-        override def createAction(): Action = {
-          val typeTextOption = Some(textField.text.value)
-          Action("Type Text", typeTextOption = typeTextOption)
-        }
+        override def createAction(): Either[String, Action] =
+          if (textField.text.value.isEmpty) Left("Please enter the text to type.")
+          else Right(Action("Type Text", typeTextOption = Some(textField.text.value)))
       }
     }
   }
@@ -878,15 +851,17 @@ object Client extends JFXApp3 {
                 onAction = _ => {
                   contentArea.children.get(0).getUserData match {
                     case actionContent: ActionTabContent =>
-                      val action = actionContent.createAction()
-                      println(s"Adding action: $action")
-                      insertIndex match {
-                        case Some(index) => actions.insert(index, action)
-                        case None => actions += action
+                      actionContent.createAction() match {
+                        case Right(action) =>
+                          insertIndex match {
+                            case Some(index) => actions.insert(index, action)
+                            case None => actions += action
+                          }
+                          actionSelectionStage.close()
+                        case Left(message) => showWarning("Incomplete action", message)
                       }
-                      actionSelectionStage.close()
                     case _ =>
-                      println("Error: Selected content does not have ActionTabContent")
+                      showWarning("No action selected", "Please choose an action type first.")
                   }
                 }
               },
@@ -909,7 +884,7 @@ object Client extends JFXApp3 {
       width = 440
       height = 500
       icons += new Image(getClass.getResourceAsStream("/icons/robot_icon.png"))
-            resizable = false
+      resizable = false
       initModality(Modality.None)
       initOwner(stage)
     }
@@ -937,9 +912,12 @@ object Client extends JFXApp3 {
             new Button("Change Action") {
               style = "-fx-background-color: #4CAF50; -fx-text-fill: white; -fx-font-size: 14px; -fx-padding: 8 15;"
               onAction = _ => {
-                val updatedAction = relevantContent.userData.asInstanceOf[ActionTabContent].createAction()
-                actions(index) = updatedAction
-                editActionStage.close()
+                relevantContent.userData.asInstanceOf[ActionTabContent].createAction() match {
+                  case Right(updatedAction) =>
+                    actions(index) = updatedAction
+                    editActionStage.close()
+                  case Left(message) => showWarning("Incomplete action", message)
+                }
               }
             },
             new Button("Cancel") {
@@ -958,6 +936,61 @@ object Client extends JFXApp3 {
   //---------------------------------------------------------------------
 
 
+  private def createActionRow(action: Action, cell: javafx.scene.control.ListCell[Action]): javafx.scene.Node = {
+    val removeButton = new Button("X") {
+      style = "-fx-background-color: #FF4136; -fx-text-fill: white; -fx-font-size: 14px;"
+      onAction = _ => {
+        val index = cell.getIndex
+        if (index >= 0 && index < actions.size) actions.remove(index)
+      }
+    }
+
+    val settingsButton = new Button("⚙") {
+      style = "-fx-background-color: #4682B4; -fx-text-fill: white; -fx-font-size: 14px;"
+      onAction = _ => {
+        val index = cell.getIndex
+        if (index >= 0 && index < actions.size) showEditActionWindow(actions(index), index)
+      }
+    }
+
+    def detailLabel(text: String): Label = new Label(text) {
+      style = "-fx-font-size: 14px;"
+      textOverrun = scalafx.scene.control.OverrunStyle.Ellipsis
+    }
+
+    val details: Option[Node] =
+      action.capturedImageOption.map[Node] { img =>
+        new ImageView(new FXImage(SwingFXUtils.toFXImage(img, null))) {
+          preserveRatio = true
+          fitHeight = 30
+          fitWidth = 100
+        }
+      }
+        .orElse(action.clickPositionOption.map(pos => detailLabel(s"(${pos.x}, ${pos.y})")))
+        .orElse(action.typeTextOption.map(text => detailLabel(s"\"$text\"")))
+        .orElse(action.waitSecondsOption.map(seconds => detailLabel(Utils.formatDuration(seconds))))
+
+    new HBox(5) {
+      alignment = Pos.CenterLeft
+      children = Seq(
+        new Label(s"${cell.getIndex + 1}.") {
+          style = "-fx-font-size: 14px; -fx-font-weight: bold;"
+          minWidth = 30
+        },
+        new Label(action.actionType) {
+          style = "-fx-font-size: 14px;"
+          minWidth = Region.USE_PREF_SIZE
+        }
+      ) ++ details ++ Seq(
+        new Region() {
+          hgrow = Priority.Always
+        },
+        settingsButton,
+        removeButton
+      )
+    }
+  }
+
   private def createStep2Scene(): Scene = {
     new Scene(700, 500) {
       root = new BorderPane {
@@ -974,115 +1007,17 @@ object Client extends JFXApp3 {
         val listView: ListView[Action] = new ListView[Action](actions) {
           prefWidth = 350
           prefHeight = 400
-          cellFactory = _ => new ListCell[Action] {
-            prefHeight = 40
-            item.onChange { (_, _, newValue) =>
-              if (newValue != null) {
-                val index = this.getIndex
+          // updateItem is also called when only the index changes (e.g. after removing an action),
+          // so the row number and the button handlers never refer to a stale position
+          cellFactory = (_: ListView[Action]) => new ListCell[Action](new javafx.scene.control.ListCell[Action] {
+            setPrefHeight(40)
 
-                val removeButton = new Button("X") {
-                  style = "-fx-background-color: #FF4136; -fx-text-fill: white; -fx-font-size: 14px;"
-                  onAction = _ => {
-                    if (index >= 0 && index < actions.size) {
-                      actions.remove(index)
-                    }
-                  }
-                }
-
-                val settingsButton = new Button("⚙") {
-                  style = "-fx-background-color: #4682B4; -fx-text-fill: white; -fx-font-size: 14px;"
-                  visible = true
-                  onAction = _ => {
-                    val action = actions(index)
-                    showEditActionWindow(action, index)
-                  }
-                }
-
-                val hbox = new HBox(5) {
-                  alignment = Pos.CenterLeft
-                  children = Seq(
-                    new Label(s"${index + 1}.") {
-                      style = "-fx-font-size: 14px; -fx-font-weight: bold;"
-                      minWidth = 30
-                    },
-                    new Label(newValue.actionType) {
-                      style = "-fx-font-size: 14px;"
-                    },
-                    new Region() {
-                      hgrow = Priority.Always
-                    },
-                    settingsButton,
-                    removeButton
-                  )
-                }
-
-                val vbox = new VBox(5) {
-                  alignment = Pos.Center
-                  children = Seq(hbox)
-                }
-
-                // Handle different types of actions
-                newValue.capturedImageOption.foreach { img =>
-                  val fxImage = SwingFXUtils.toFXImage(img, null)
-                  val imageView = new ImageView(new FXImage(fxImage)) {
-                    preserveRatio = true
-                    fitHeight = 30
-                    fitWidth = 100
-                  }
-                  hbox.children.add(2, imageView)
-                  vbox.alignment = Pos.CenterLeft
-                }
-
-                newValue.clickPositionOption.foreach { clickPos =>
-                  val positionLabel = new Label(s"(${clickPos.x}, ${clickPos.y})") {
-                    maxWidth = Double.MaxValue
-                    alignment = Pos.CenterLeft
-                    style = "-fx-font-size: 14px;"
-                  }
-                  hbox.children.add(2, positionLabel)
-                }
-
-                newValue.typeTextOption.foreach { text =>
-                  val textLabel = new Label(s"\"$text\"") {
-                    maxWidth = Double.MaxValue
-                    alignment = Pos.CenterLeft
-                    style = "-fx-font-size: 14px;"
-                  }
-                  hbox.children.add(2, textLabel)
-                }
-
-                newValue.waitSecondsOption.foreach { totalSeconds =>
-                  val hours = totalSeconds / 3600
-                  val minutes = (totalSeconds % 3600) / 60
-                  val seconds = totalSeconds % 60
-
-                  val timeComponents = Seq(
-                    if (hours > 0) s"$hours hour${if (hours > 1) "s" else ""}" else "",
-                    if (minutes > 0) s"$minutes minute${if (minutes > 1) "s" else ""}" else "",
-                    if (seconds > 0) s"$seconds second${if (seconds > 1) "s" else ""}" else ""
-                  ).filter(_.nonEmpty)
-
-                  val timeString = timeComponents match {
-                    case Nil => "0 seconds"
-                    case list => list.mkString(" ")
-                  }
-
-                  val textLabel = new Label(timeString) {
-                    style = "-fx-font-size: 14px;"
-                  }
-                  hbox.children.add(2, textLabel)
-                }
-
-                graphic = new VBox(5) {
-                  children = Seq(hbox)
-                }
-                text = null
-              } else {
-                graphic = null
-                text = null
-              }
+            override def updateItem(action: Action, empty: Boolean): Unit = {
+              super.updateItem(action, empty)
+              setText(null)
+              setGraphic(if (empty || action == null) null else createActionRow(action, this))
             }
-          }
+          })
 
           var previousSelectedIndex = -1
           onMouseClicked = (event: MouseEvent) => if (event.getClickCount == 1) {
@@ -1160,16 +1095,16 @@ object Client extends JFXApp3 {
 
   private def createStep3Scene(): Scene = {
 
-
-    val currentActionLabel = new Label("Ready to execute")
-    currentActionLabel.style = "-fx-font-size: 16px;"
+    val currentActionLabel = new Label(if (busy.get()) "Macro is running..." else "Ready to execute") {
+      style = "-fx-font-size: 16px;"
+      wrapText = true
+    }
 
     val executeNowButton = new Button("Execute Now")
     val scheduleButton = new Button("Schedule")
 
     val selectedMode = new SimpleStringProperty("ExecuteNow")
 
-    // or "ExecuteNow"
     def updateButtonStyles(): Unit = {
       executeNowButton.style = {
         if (selectedMode.get() == "ExecuteNow") "-fx-background-color: #4682B4; -fx-text-fill: white;" else "-fx-background-color: #D3D3D3;"
@@ -1191,43 +1126,59 @@ object Client extends JFXApp3 {
 
     updateButtonStyles()
 
-    val hourSpinner = new Spinner[Int](0, 23, 0) {
-      prefWidth = 60
-    }
-    val minuteSpinner = new Spinner[Int](0, 59, 0) {
-      prefWidth = 60
-    }
-    val secondSpinner = new Spinner[Int](0, 59, 0) {
-      prefWidth = 60
-    }
+    def timeSpinner(max: Int, initial: Int) = commitOnFocusLost(new Spinner[Int](0, max, initial) {
+      editable = true
+      prefWidth = 65
+    })
 
-    val repeatCountSpinner = new Spinner[Int](1, 1000, 1) {
-      prefWidth = 70
-    }
-    val repeatIntervalSpinner = new Spinner[Int](1, 1000, 1) {
-      prefWidth = 70
-    }
+    val now = LocalDateTime.now()
+    val hourSpinner = timeSpinner(23, now.getHour)
+    val minuteSpinner = timeSpinner(59, now.getMinute)
+    val secondSpinner = timeSpinner(59, 0)
+
+    val repeatCountSpinner = commitOnFocusLost(new Spinner[Int](1, 1000, 1) {
+      editable = true
+      prefWidth = 80
+    })
+    val repeatIntervalSpinner = commitOnFocusLost(new Spinner[Int](1, 1000, 1) {
+      editable = true
+      prefWidth = 80
+    })
     val repeatUnitComboBox = new ComboBox[String](ObservableBuffer("Seconds", "Minutes", "Hours"))
     repeatUnitComboBox.value = "Minutes"
 
     val executeButton = new Button("Execute") {
       style = "-fx-background-color: #4CAF50; -fx-text-fill: white; -fx-font-size: 16px; -fx-padding: 10 20;"
+      disable <== busy
       onAction = _ => if (isSelectedWindowOpen) {
         stopRequested = false
-        val repeatCount = repeatCountSpinner.value.value
+        val repeatCount = spinnerValue(repeatCountSpinner)
+        // Snapshot the actions so later edits do not affect a running or scheduled macro
+        val macroActions = actions.toList
         if (selectedMode.get() == "ExecuteNow") {
-
-          executeMacroNow(currentActionLabel, repeatCount)
+          executeMacroNow(currentActionLabel, macroActions, repeatCount)
         } else {
-          val now = LocalDateTime.now()
-          val scheduledTime = now
-            .withHour(hourSpinner.value.value)
-            .withMinute(minuteSpinner.value.value)
-            .withSecond(secondSpinner.value.value)
-          val repeatInterval = repeatIntervalSpinner.value.value
-          val repeatUnit = repeatUnitComboBox.value.value
-          executeMacroWithFlexibleSchedule(currentActionLabel, repeatCount, scheduledTime, repeatCount, repeatInterval, repeatUnit)
+          val scheduledTime = LocalDateTime.now()
+            .withHour(spinnerValue(hourSpinner))
+            .withMinute(spinnerValue(minuteSpinner))
+            .withSecond(spinnerValue(secondSpinner))
+            .withNano(0)
+          val interval = repeatUnitComboBox.value.value match {
+            case "Seconds" => Duration.ofSeconds(spinnerValue(repeatIntervalSpinner))
+            case "Minutes" => Duration.ofMinutes(spinnerValue(repeatIntervalSpinner))
+            case _ => Duration.ofHours(spinnerValue(repeatIntervalSpinner))
+          }
+          scheduleMacro(currentActionLabel, macroActions, scheduledTime, repeatCount, interval)
         }
+      }
+    }
+
+    val stopButton = new Button("Stop") {
+      style = "-fx-background-color: #FF4136; -fx-text-fill: white; -fx-font-size: 16px; -fx-padding: 10 20;"
+      disable <== busy.not()
+      onAction = _ => {
+        stopRequested = true
+        if (cancelSchedule()) currentActionLabel.text = "Schedule cancelled"
       }
     }
 
@@ -1273,7 +1224,7 @@ object Client extends JFXApp3 {
                 new HBox(10) {
                   alignment = Pos.Center
                   children = Seq(
-                    new Label("Time:") {
+                    new Label("Start at:") {
                       style = "-fx-font-size: 16px;"
                     },
                     hourSpinner,
@@ -1295,7 +1246,10 @@ object Client extends JFXApp3 {
                 }
               )
             },
-            executeButton,
+            new HBox(10) {
+              alignment = Pos.Center
+              children = Seq(executeButton, stopButton)
+            },
             new VBox(10) {
               alignment = Pos.Center
               children = Seq(currentActionLabel)
@@ -1308,6 +1262,7 @@ object Client extends JFXApp3 {
           children = Seq(
             new Button("Previous") {
               style = "-fx-background-color: #4682B4; -fx-text-fill: white; -fx-font-size: 14px; -fx-padding: 8 15;"
+              disable <== busy
               onAction = _ => showStep(2)
             }
           )
@@ -1316,122 +1271,127 @@ object Client extends JFXApp3 {
     }
   }
 
-  private def executeMacroWithFlexibleSchedule(currentActionLabel: Label, loopCount: Int, scheduledTime: LocalDateTime, repeatCount: Int, repeatInterval: Int, repeatUnit: String): Unit = {
+  /** Runs the macro `runs` times, starting at `startTime` (or tomorrow if that time has passed) and then every `interval`. */
+  private def scheduleMacro(currentActionLabel: Label, macroActions: List[Action], startTime: LocalDateTime, runs: Int, interval: Duration): Unit = {
     val now = LocalDateTime.now()
-    var nextRun = if (scheduledTime.isBefore(now)) scheduledTime.plusDays(1) else scheduledTime
+    val firstRun = if (startTime.isBefore(now)) startTime.plusDays(1) else startTime
+    val timeFormat = DateTimeFormatter.ofPattern("HH:mm:ss")
 
-    val scheduler = Executors.newScheduledThreadPool(1)
+    cancelSchedule()
+    val scheduler = Executors.newSingleThreadScheduledExecutor((r: Runnable) => {
+      val thread = new Thread(r, "macro-scheduler")
+      thread.setDaemon(true)
+      thread
+    })
+    activeScheduler = Some(scheduler)
+    busy.set(true)
 
-    val task: Runnable = new Runnable {
-      var executionCount = 0
+    val executionCount = new AtomicInteger(0)
 
-      override def run(): Unit = {
-        if (executionCount < repeatCount) {
-          Platform.runLater {
-            currentActionLabel.text = s"Executing scheduled macro (${executionCount + 1}/$repeatCount)"
-          }
-          executeMacroNow(currentActionLabel, loopCount)
-          executionCount += 1
-
-          // Schedule next run
-          val delay = repeatUnit match {
-            case "Seconds" => Duration.ofSeconds(repeatInterval)
-            case "Minutes" => Duration.ofMinutes(repeatInterval)
-            case "Hours" => Duration.ofHours(repeatInterval)
-          }
-          nextRun = nextRun.plus(delay)
-          scheduler.schedule(this, Duration.between(LocalDateTime.now(), nextRun).toMillis, TimeUnit.MILLISECONDS)
-        } else {
+    // A single-threaded executor never runs two macro executions at the same time; if a run takes
+    // longer than the interval, the next run starts right after it.
+    scheduler.scheduleAtFixedRate(() => {
+      val run = executionCount.incrementAndGet()
+      if (stopRequested || run > runs) {
+        scheduler.shutdown()
+      } else {
+        updateLabel(currentActionLabel, s"Scheduled run $run/$runs")
+        val completed = runMacro(currentActionLabel, macroActions, 1, s"Run $run/$runs")
+        if (!completed || run == runs) {
           scheduler.shutdown()
+          Platform.runLater {
+            if (activeScheduler.contains(scheduler)) {
+              activeScheduler = None
+              busy.set(false)
+            }
+          }
+        } else {
+          val nextRun = firstRun.plus(interval.multipliedBy(run.toLong))
+          val next = if (nextRun.isAfter(LocalDateTime.now())) nextRun.format(timeFormat) else "now"
+          updateLabel(currentActionLabel, s"Run $run/$runs completed. Next run: $next")
         }
       }
-    }
+    }, Duration.between(now, firstRun).toMillis, interval.toMillis, TimeUnit.MILLISECONDS)
 
-    val initialDelay = Duration.between(now, nextRun)
-    scheduler.schedule(task, initialDelay.toMillis, TimeUnit.MILLISECONDS)
-
-    Platform.runLater {
-      currentActionLabel.text = s"Scheduled to start at ${nextRun.format(DateTimeFormatter.ofPattern("HH:mm:ss"))}, repeating $repeatCount times"
-    }
+    currentActionLabel.text = s"Scheduled to start at ${firstRun.format(timeFormat)}, running $runs time${if (runs > 1) "s" else ""}"
   }
 
-  private def isSelectedWindowOpen: Boolean = selectedWindow match {
-    case Some(window) => User32.INSTANCE.IsWindow(window.getHWND)
-    case None =>
+  /** Cancels a pending schedule. Returns true if there was one. Must be called on the JavaFX thread. */
+  private def cancelSchedule(): Boolean = activeScheduler match {
+    case Some(scheduler) =>
+      scheduler.shutdownNow()
+      activeScheduler = None
+      busy.set(false)
+      true
+    case None => false
+  }
+
+  private def isSelectedWindowOpen: Boolean = {
+    val open = selectedWindow.exists(window => User32.INSTANCE.IsWindow(window.getHWND))
+    if (!open) {
       println("Window closed")
       Platform.runLater {
-        actions.clear()
         new Alert(AlertType.Warning) {
+          initOwner(stage)
           title = "Window closed"
           headerText = "The selected window was closed."
           contentText = "Please select a window"
         }.showAndWait()
         showStep(1)
       }
-      false
-  }
-
-  private def executeMacroWithSchedule(currentActionLabel: Label, loopCount: Int, scheduledDateTime: LocalDateTime): Unit = {
-    val now = LocalDateTime.now()
-    val delay = Duration.between(now, scheduledDateTime)
-
-    if (delay.isNegative) {
-      new Alert(AlertType.Warning) {
-        title = "Invalid Schedule"
-        headerText = "The scheduled time is in the past."
-        contentText = "Please select a future date and time."
-      }.showAndWait()
-      return
     }
-
-    currentActionLabel.text = s"Scheduled for ${scheduledDateTime.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"))}"
-
-    val scheduler = Executors.newSingleThreadScheduledExecutor()
-    scheduler.schedule(new Runnable {
-      override def run(): Unit = {
-        Platform.runLater {
-          currentActionLabel.text = "Executing macro..."
-        }
-        for (i <- 1 to loopCount) {
-          executeMacro(currentActionLabel, i, loopCount)
-          if (i < loopCount) {
-            Thread.sleep(500) // 5-second delay between loops
-          }
-        }
-        scheduler.shutdown()
-      }
-    }, delay.toMillis, TimeUnit.MILLISECONDS)
+    open
   }
 
-  private def executeMacroNow(currentActionLabel: Label, loopCount: Int): Unit = {
-    new Thread(() => {
-
-      for (i <- 1 to loopCount) {
-        executeMacro(currentActionLabel, i, loopCount)
-        if (i < loopCount) {
-          Thread.sleep(500) // 5-second delay between loops
-        }
-      }
-    }).start()
+  private def updateLabel(label: Label, text: String): Unit = Platform.runLater {
+    label.text = text
   }
 
+  private def executeMacroNow(currentActionLabel: Label, macroActions: List[Action], loopCount: Int): Unit = {
+    busy.set(true)
+    val worker = new Thread(() => {
+      try runMacro(currentActionLabel, macroActions, loopCount)
+      finally Platform.runLater(busy.set(false))
+    }, "macro-worker")
+    worker.setDaemon(true)
+    worker.start()
+  }
 
-  private def executeMacro(currentActionLabel: Label, currentLoop: Int, totalLoops: Int): Unit = if (!stopRequested) {
+  /** Sleeps in small steps so that a stop request is handled promptly. */
+  private def sleepUnlessStopped(millis: Long): Unit = {
+    val end = System.currentTimeMillis() + millis
+    while (!stopRequested && System.currentTimeMillis() < end) {
+      Thread.sleep(Math.min(100L, end - System.currentTimeMillis()).max(1L))
+    }
+  }
 
+  /**
+   * Executes all actions `loopCount` times on the calling (non-JavaFX) thread.
+   * Returns true if every action completed, false if the macro was stopped or failed.
+   */
+  private def runMacro(currentActionLabel: Label, macroActions: List[Action], loopCount: Int, prefix: String = ""): Boolean = {
     val robot = new Robot()
-    val totalActions = actions.size
+    val totalActions = macroActions.size
 
+    def fail(titleText: String, message: String): Boolean = {
+      stopRequested = true
+      Platform.runLater {
+        new Alert(AlertType.Error) {
+          initOwner(stage)
+          title = titleText
+          headerText = message
+        }.showAndWait()
+      }
+      false
+    }
 
     def performClick(x: Int, y: Int, action: Action): Unit = {
       // Move the mouse in a human-like manner
-
       Mouse.moveHumanLike(robot, x, y, action.clickSettings.mouseSpeed)
 
-      // Perform the click based on settings
       val button = action.clickSettings.button match {
-        case "left" => InputEvent.BUTTON1_DOWN_MASK
         case "right" => InputEvent.BUTTON3_DOWN_MASK
-        //case "Middle" => InputEvent.BUTTON2_DOWN_MASK //TODO implement middle
+        case _ => InputEvent.BUTTON1_DOWN_MASK
       }
 
       val clickCount = action.clickSettings.clicks
@@ -1440,147 +1400,131 @@ object Client extends JFXApp3 {
         robot.mouseRelease(button)
         if (clickCount > 1) Thread.sleep(50) // Small delay between clicks for double-click
       }
+
+      sleepUnlessStopped(action.clickSettings.duration)
     }
 
+    /** Screen area of the window's client area (without title bar and borders). */
+    def clientArea(hwnd: HWND): Rectangle = {
+      val rect = new RECT()
+      User32.INSTANCE.GetWindowRect(hwnd, rect)
 
-    def executeAction(index: Int): Unit = {
+      val clientRect = new RECT()
+      User32.INSTANCE.GetClientRect(hwnd, clientRect)
 
-      if (index < actions.size && !stopRequested) {
-        val action = actions(index)
-        Platform.runLater {
-          currentActionLabel.text = s"Loop $currentLoop/$totalLoops - Executing action ${index + 1} of $totalActions: ${action.actionType}"
+      val borderWidth = (rect.right - rect.left - clientRect.right) / 2
+      val titleBarHeight = rect.bottom - rect.top - clientRect.bottom - borderWidth
+
+      new Rectangle(rect.left + borderWidth, rect.top + titleBarHeight, clientRect.right, clientRect.bottom)
+    }
+
+    def findImage(hwnd: HWND, image: BufferedImage): Option[(Int, Int)] = {
+      val deadline = System.currentTimeMillis() + VisualSearchTimeoutMs
+      var found: Option[(Int, Int)] = None
+      // The element might not be visible yet (e.g. a page is still loading), so keep looking for a while
+      while (found.isEmpty && !stopRequested && System.currentTimeMillis() < deadline) {
+        val area = clientArea(hwnd)
+        if (area.width > 0 && area.height > 0) {
+          found = robot.createScreenCapture(area).findBestMatch(image).map { m =>
+            (area.x + m.rect.x + m.rect.width / 2, area.y + m.rect.y + m.rect.height / 2)
+          }
         }
-
-        action.actionType match {
-          case "Click Position" =>
-            action.clickPositionOption.foreach { clickPosition =>
-
-              selectedWindow.foreach { window =>
-                val hwnd = window.getHWND
-
-                // Get the current window position and size
-                val currentBounds = WindowUtils.getWindowLocationAndSize(hwnd)
-
-                // Adjust the window size if it's different from the config
-                if (currentBounds.width != clickPosition.windowDimension.width ||
-                  currentBounds.height != clickPosition.windowDimension.height) {
-                  User32.INSTANCE.SetWindowPos(
-                    hwnd,
-                    null,
-                    currentBounds.x,
-                    currentBounds.y,
-                    clickPosition.windowDimension.width,
-                    clickPosition.windowDimension.height,
-                    0x0004 | 0x0010 // SWP_NOZORDER | SWP_NOACTIVATE
-                  )
-                }
-                // Bring the window to front
-                windowToFront(hwnd)
-
-                // Get the window position
-                val windowBounds = WindowUtils.getWindowLocationAndSize(hwnd)
-
-                // Calculate the absolute click position
-                val clickX = windowBounds.x + clickPosition.x
-                val clickY = windowBounds.y + clickPosition.y
-
-                performClick(clickX, clickY, action)
-
-                // Wait after the click
-                Thread.sleep(action.clickSettings.duration)
-              }
-            }
-
-
-          case "Click Visual" =>
-            action.capturedImageOption.foreach { capturedImage =>
-
-              selectedWindow.foreach { window =>
-
-                val hwnd = window.getHWND
-                windowToFront(hwnd)
-
-                val rect = new RECT()
-                User32.INSTANCE.GetWindowRect(hwnd, rect)
-
-                val clientRect = new RECT()
-                User32.INSTANCE.GetClientRect(hwnd, clientRect)
-
-                val borderWidth = (rect.right - rect.left - clientRect.right) / 2
-                val titleBarHeight = rect.bottom - rect.top - clientRect.bottom - borderWidth
-
-                val x = rect.left + borderWidth
-                val y = rect.top + titleBarHeight
-
-                val screenRect = new Rectangle(x, y, clientRect.right, clientRect.bottom)
-
-                val screenCapture = robot.createScreenCapture(screenRect)
-
-                // Perform template matching to find the captured image
-                screenCapture.findBestMatch(capturedImage) match {
-                  case Some(match0) =>
-                    val matchRect = match0.rect
-
-                    // Calculate the center of the matched rectangle
-                    val centerX = x + matchRect.x + matchRect.width / 2
-                    val centerY = y + matchRect.y + matchRect.height / 2
-
-                    performClick(centerX, centerY, action)
-                  case None => {
-                    println("Unable to find the captured image in the window")
-                    Platform.runLater {
-                      new Alert(AlertType.Error) {
-                        title = "Image Not Found"
-                        headerText = "The captured image was not found in the window."
-                      }.showAndWait()
-                    }
-
-                  }
-                }
-              }
-            }
-
-          case "Type Text" =>
-            action.typeTextOption.foreach { text =>
-              for (char <- text) {
-                val keyCode = char.toUpper.toInt
-                robot.keyPress(keyCode)
-                robot.keyRelease(keyCode)
-                Thread.sleep(50) // Small delay between key presses
-              }
-            }
-
-          case "Wait" =>
-            action.waitSecondsOption.foreach { seconds =>
-              Thread.sleep(seconds * 1000)
-            }
-
-          case _ =>
-          // Handle other action types if needed
-        }
-
-        // Schedule the next action execution after a delay
-        Platform.runLater {
-          executeAction(index + 1)
-        }
-      } else {
-        // All actions completed
-        Platform.runLater {
-          currentActionLabel.text = if (currentLoop == totalLoops) "Macro execution completed" else s"Loop $currentLoop/$totalLoops completed"
-
-        }
+        if (found.isEmpty) sleepUnlessStopped(250)
       }
+      found
     }
 
-    if (actions.nonEmpty) executeAction(0)
+    def executeAction(action: Action): Boolean = action.actionType match {
+      case "Click Position" | "Click Visual" if !selectedWindow.exists(w => User32.INSTANCE.IsWindow(w.getHWND)) =>
+        fail("Window closed", "The selected window was closed during execution.")
 
+      case "Click Position" =>
+        for (clickPosition <- action.clickPositionOption; window <- selectedWindow) {
+          val hwnd = window.getHWND
+
+          // Restore the window size the position was recorded with
+          val currentBounds = WindowUtils.getWindowLocationAndSize(hwnd)
+          if (currentBounds.width != clickPosition.windowDimension.width ||
+            currentBounds.height != clickPosition.windowDimension.height) {
+            User32.INSTANCE.SetWindowPos(
+              hwnd,
+              null,
+              currentBounds.x,
+              currentBounds.y,
+              clickPosition.windowDimension.width,
+              clickPosition.windowDimension.height,
+              0x0004 | 0x0010 // SWP_NOZORDER | SWP_NOACTIVATE
+            )
+          }
+          windowToFront(hwnd)
+
+          val windowBounds = WindowUtils.getWindowLocationAndSize(hwnd)
+          performClick(windowBounds.x + clickPosition.x, windowBounds.y + clickPosition.y, action)
+        }
+        true
+
+      case "Click Visual" =>
+        (for (capturedImage <- action.capturedImageOption; window <- selectedWindow) yield {
+          val hwnd = window.getHWND
+          windowToFront(hwnd)
+
+          findImage(hwnd, capturedImage) match {
+            case Some((x, y)) =>
+              performClick(x, y, action)
+              true
+            case None if stopRequested => false
+            case None =>
+              println("Unable to find the captured image in the window")
+              fail("Image Not Found", s"The captured image was not found in the window within ${VisualSearchTimeoutMs / 1000} seconds. The macro was stopped.")
+          }
+        }).getOrElse(true)
+
+      case "Type Text" =>
+        action.typeTextOption.foreach(text => Keyboard.typeText(robot, text, () => stopRequested))
+        true
+
+      case "Wait" =>
+        action.waitSecondsOption.foreach(seconds => sleepUnlessStopped(seconds * 1000L))
+        true
+
+      case _ => true
+    }
+
+    val labelPrefix = if (prefix.nonEmpty) s"$prefix - " else ""
+    var completed = true
+    try {
+      var loop = 1
+      while (completed && loop <= loopCount) {
+        val remaining = macroActions.zipWithIndex.iterator
+        while (completed && remaining.hasNext) {
+          val (action, index) = remaining.next()
+          if (stopRequested) completed = false
+          else {
+            updateLabel(currentActionLabel, s"${labelPrefix}Loop $loop/$loopCount - Executing action ${index + 1} of $totalActions: ${action.actionType}")
+            completed = executeAction(action) && !stopRequested
+          }
+        }
+        if (completed && loop < loopCount) sleepUnlessStopped(500) // Short pause between loops
+        loop += 1
+      }
+    } catch {
+      case e: Exception =>
+        e.printStackTrace()
+        completed = fail("Execution failed", s"An error occurred while executing the macro: ${e.getMessage}")
+    }
+
+    updateLabel(currentActionLabel, if (completed) s"${labelPrefix}Macro execution completed" else s"${labelPrefix}Macro execution stopped")
+    completed
   }
 
   //--------------------------------------------------------------------------
 
 
   def windowToFront(hwnd: HWND): Unit = {
-    User32.INSTANCE.ShowWindow(hwnd, User32.SW_SHOWDEFAULT)
+    // Only restore minimized windows; SW_SHOWDEFAULT would un-maximize maximized ones
+    val placement = new WinUser.WINDOWPLACEMENT()
+    User32.INSTANCE.GetWindowPlacement(hwnd, placement)
+    if (placement.showCmd == WinUser.SW_SHOWMINIMIZED) User32.INSTANCE.ShowWindow(hwnd, WinUser.SW_RESTORE)
     User32.INSTANCE.SetForegroundWindow(hwnd)
     Thread.sleep(200)
   }
@@ -1593,19 +1537,25 @@ object Client extends JFXApp3 {
 
       windowToFront(hwnd)
 
-      // Create a transparent overlay stage
       val screenBounds = Screen.primary.bounds
+
+      // Take the screenshot before the overlay is shown, so the captured image contains neither
+      // the overlay tint nor the selection rectangle (both would lower the match confidence later)
+      val screenshot = new Robot().createScreenCapture(
+        new Rectangle(screenBounds.minX.toInt, screenBounds.minY.toInt, screenBounds.width.toInt, screenBounds.height.toInt))
+
+      // Create a transparent overlay stage
       val overlayStage: Stage = new Stage {
         title = "Select Area to Capture"
         fullScreen = true
-        initStyle(javafx.stage.StageStyle.TRANSPARENT) // Add this line
+        fullScreenExitHint = "Drag to select the area to capture (max. 400x400). Press ESC to cancel."
+        initStyle(javafx.stage.StageStyle.TRANSPARENT)
         scene = new Scene(screenBounds.width, screenBounds.height) {
           fill = Color.Transparent
           val canvas = new Canvas(screenBounds.width, screenBounds.height)
           root = new StackPane {
             children = canvas
-            style = "-fx-background-color: rgba(0, 0, 0, 0.1);" // Add this line
-
+            style = "-fx-background-color: rgba(0, 0, 0, 0.1);"
           }
 
           onKeyPressed = (e: javafx.scene.input.KeyEvent) => {
@@ -1681,17 +1631,13 @@ object Client extends JFXApp3 {
           }
 
           def captureSelectedArea(): Unit = {
-            val x = Math.min(startX, endX).toInt
-            val y = Math.min(startY, endY).toInt
-            val width = Math.min(Math.abs(endX - startX).toInt, 400)
-            val height = Math.min(Math.abs(endY - startY).toInt, 400)
+            val x = Math.min(startX, endX).toInt.max(0)
+            val y = Math.min(startY, endY).toInt.max(0)
+            val width = Math.min(Math.abs(endX - startX).toInt, 400).min(screenshot.getWidth - x)
+            val height = Math.min(Math.abs(endY - startY).toInt, 400).min(screenshot.getHeight - y)
 
             if (width > 0 && height > 0) {
-              Thread.sleep(1)
-              val robot = new Robot()
-              val capturedImage = robot.createScreenCapture(new Rectangle(x, y, width, height))
-              imageOption = Some(capturedImage)
-
+              imageOption = Some(screenshot.crop(x, y, width, height))
             } else {
               println("No area selected to capture")
               Platform.runLater {
@@ -1701,7 +1647,6 @@ object Client extends JFXApp3 {
                 }.showAndWait()
               }
             }
-
           }
         }
       }
@@ -1727,6 +1672,7 @@ object Client extends JFXApp3 {
       val overlayStage: Stage = new Stage {
         title = "Click Position"
         fullScreen = true
+        fullScreenExitHint = "Click the position to record. Press ESC to cancel."
         initStyle(javafx.stage.StageStyle.TRANSPARENT)
         scene = new Scene(screenBounds.width, screenBounds.height) {
           fill = Color.Transparent
