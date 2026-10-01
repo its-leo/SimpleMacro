@@ -8,7 +8,6 @@ import scalafx.application.Platform
 import scalafx.beans.property.StringProperty
 import scalafx.collections.ObservableBuffer
 import scalafx.geometry.{Insets, Pos}
-import scalafx.scene.Scene
 import scalafx.scene.control._
 import scalafx.scene.layout._
 import scalafx.stage.Stage
@@ -47,6 +46,7 @@ class ExecutionView(state: AppState, stage: Stage, onPrevious: () => Unit) {
   private val logItems = ObservableBuffer.from(state.log.entries)
   private val logView = new ListView[Entry](logItems) {
     prefHeight = 170
+    vgrow = Priority.Always
     style = "-fx-font-family: 'Consolas', 'Monospaced'; -fx-font-size: 12px;"
     cellFactory = (_: ListView[Entry]) => new ListCell[Entry](new javafx.scene.control.ListCell[Entry] {
       override def updateItem(entry: Entry, empty: Boolean): Unit = {
@@ -136,8 +136,7 @@ class ExecutionView(state: AppState, stage: Stage, onPrevious: () => Unit) {
       }
   }
 
-  val scene: Scene = new Scene {
-    root = new BorderPane {
+  val root: BorderPane = new BorderPane {
       top = new VBox(6) {
         padding = Insets(10, 15, 5, 15)
         children = Seq(
@@ -227,6 +226,5 @@ class ExecutionView(state: AppState, stage: Stage, onPrevious: () => Unit) {
           onAction = _ => onPrevious()
         })
       }
-    }
   }
 }

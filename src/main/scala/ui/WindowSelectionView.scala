@@ -5,13 +5,13 @@ import javafx.animation.{Animation, KeyFrame, Timeline}
 import scalafx.Includes._
 import scalafx.collections.ObservableBuffer
 import scalafx.geometry.{Insets, Pos}
-import scalafx.scene.Scene
 import scalafx.scene.control.{Button, ListCell, ListView, TextField}
 import scalafx.scene.layout._
+import scalafx.stage.Stage
 import ui.UiKit._
 
 /** Step 1: choose the window the macro runs in. */
-class WindowSelectionView(state: AppState, onNext: () => Unit) {
+class WindowSelectionView(state: AppState, stage: Stage, onNext: () => Unit) {
 
   private var searchTerm = ""
 
@@ -62,13 +62,12 @@ class WindowSelectionView(state: AppState, onNext: () => Unit) {
     case Some(entry) =>
       state.selectedWindow = Some(entry.window)
       onNext()
-    case None => showWarning(listView.scene.value.window.value, "No window selected", "Please select the window the macro should run in.")
+    case None => showWarning(stage, "No window selected", "Please select the window the macro should run in.")
   }
 
   def dispose(): Unit = refreshTimeline.stop()
 
-  val scene: Scene = new Scene {
-    root = new BorderPane {
+  val root: BorderPane = new BorderPane {
       top = new HBox {
         alignment = Pos.CenterLeft
         padding = Insets(10, 0, 10, 15)
@@ -103,6 +102,5 @@ class WindowSelectionView(state: AppState, onNext: () => Unit) {
         padding = Insets(0, 15, 15, 15)
         children = Seq(button("Next", PrimaryStyle)(next()))
       }
-    }
   }
 }

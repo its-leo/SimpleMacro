@@ -169,11 +169,17 @@ class ImageCapturePane(context: EditorContext, existing: Option[BufferedImage]) 
   var capturedImage: Option[BufferedImage] = existing
 
   private val imageView = new ImageView {
-    fitWidth = 220
-    fitHeight = 90
     preserveRatio = true
-    image = existing.map(toFxImage).orNull
   }
+
+  /** Shows the image at its original size, scaled down only if it is larger than the preview area. */
+  private def show(img: BufferedImage): Unit = {
+    imageView.image = toFxImage(img)
+    imageView.fitWidth = img.getWidth.min(220).toDouble
+    imageView.fitHeight = img.getHeight.min(90).toDouble
+  }
+
+  existing.foreach(show)
   private val placeholder = new Label("No image captured yet") {
     style = HintStyle
     visible <== imageView.image.isNull
@@ -184,7 +190,7 @@ class ImageCapturePane(context: EditorContext, existing: Option[BufferedImage]) 
     style = SuccessStyle
     onAction = _ => context.captureImage("Drag a rectangle around the element").foreach { captured =>
       capturedImage = Some(captured)
-      imageView.image = toFxImage(captured)
+      show(captured)
       text = "Recapture Image"
     }
   }

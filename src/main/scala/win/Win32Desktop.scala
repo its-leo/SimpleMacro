@@ -36,7 +36,11 @@ object Win32Desktop {
    * the awareness was already set by the Java launcher.
    */
   def enablePerMonitorDpiAwareness(): Unit =
-    Try(User32Ext.INSTANCE.SetProcessDpiAwarenessContext(Pointer.createConstant(-4L)))
+    try User32Ext.INSTANCE.SetProcessDpiAwarenessContext(Pointer.createConstant(-4L))
+    catch {
+      // UnsatisfiedLinkError (not caught by Try) on Windows versions without this function
+      case _: UnsatisfiedLinkError | _: Exception =>
+    }
 }
 
 class Win32Window(val hwnd: HWND, initialTitle: String) extends TargetWindow {

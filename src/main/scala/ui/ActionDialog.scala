@@ -19,7 +19,7 @@ class ActionDialog(state: AppState, parentWindow: Window, existing: Option[Macro
   val stage: Stage = new Stage {
     title = if (existing.isDefined) "Edit Action" else "Add Action"
     width = 560
-    height = 720
+    height = 690
     icons += appIcon
     initModality(Modality.WindowModal)
     initOwner(parentWindow)
@@ -30,7 +30,8 @@ class ActionDialog(state: AppState, parentWindow: Window, existing: Option[Macro
   private val contentArea = new ScrollPane {
     fitToWidth = true
     vgrow = Priority.Always
-    style = "-fx-background-color: transparent; -fx-background: transparent;"
+    // Only make the border invisible: "-fx-background: transparent" would also turn the text color white
+    style = "-fx-background-color: transparent;"
   }
 
   private val typeButtons: Seq[(ActionKind, Button)] = ActionEditors.kinds.map { kind =>

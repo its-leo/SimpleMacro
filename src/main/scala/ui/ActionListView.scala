@@ -7,7 +7,7 @@ import scalafx.geometry.{Insets, Pos}
 import scalafx.scene.control._
 import scalafx.scene.image.ImageView
 import scalafx.scene.layout._
-import scalafx.scene.{Node, Scene}
+import scalafx.scene.Node
 import scalafx.stage.FileChooser.ExtensionFilter
 import scalafx.stage.{FileChooser, Stage}
 import ui.UiKit._
@@ -203,8 +203,7 @@ class ActionListView(state: AppState, stage: Stage, onPrevious: () => Unit, onNe
     text <== state.currentFile.map(_.map(f => s"File: ${f.getName}").getOrElse("Not saved yet (changes are saved automatically for the next start)"))
   }
 
-  val scene: Scene = new Scene {
-    root = new BorderPane {
+  val root: BorderPane = new BorderPane {
       top = new VBox(6) {
         padding = Insets(10, 15, 8, 15)
         children = Seq(
@@ -245,6 +244,5 @@ class ActionListView(state: AppState, stage: Stage, onPrevious: () => Unit, onNe
           }
         )
       }
-    }
   }
 }

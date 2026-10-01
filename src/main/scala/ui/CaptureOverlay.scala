@@ -43,6 +43,7 @@ object CaptureOverlay {
 
   /** Lets the user select an area and returns its content as it looked before the overlay was shown. */
   def pickImage(desktop: Desktop, window: TargetWindow, hint: String): Option[BufferedImage] = {
+    window.toFront()
     val screen = desktop.virtualScreen
     // Screenshot before the overlay is shown, so the image contains neither the overlay tint nor the selection
     val snapshot = desktop.capture(screen)
@@ -131,16 +132,11 @@ object CaptureOverlay {
           onKeyPressed = (e: KeyEvent) => if (e.code == KeyCode.Escape) closeAll()
         }
         canvas.onMouseMoved = (e: MouseEvent) => redraw(e.x, e.y, dragging = false)
-        canvas.onMousePressed = (e: MouseEvent) => {
-          pressed = Some((desktop.cursorPosition, e.x, e.y))
-          if (mode == PointMode) {
-            result = pressed.map(p => (p._1, p._1))
-            closeAll()
-          }
-        }
-        canvas.onMouseDragged = (e: MouseEvent) => redraw(e.x, e.y, dragging = true)
-        canvas.onMouseReleased = (_: MouseEvent) => if (mode != PointMode) {
-          result = pressed.map(p => (p._1, desktop.cursorPosition))
+        canvas.onMousePressed = (e: MouseEvent) => pressed = Some((desktop.cursorPosition, e.x, e.y))
+        canvas.onMouseDragged = (e: MouseEvent) => if (mode != PointMode) redraw(e.x, e.y, dragging = true)
+        // Finish on release, so the release does not reach the application below the overlay
+        canvas.onMouseReleased = (_: MouseEvent) => {
+          result = pressed.map(p => (p._1, if (mode == PointMode) p._1 else desktop.cursorPosition))
           closeAll()
         }
         onShown = _ => redraw(-100, -100, dragging = false)
